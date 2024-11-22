@@ -26,7 +26,7 @@ def parse_args():
 
     parser.add_argument('--i_frame_model_path', type=str)
     parser.add_argument('--i_frame_q_scales', type=float, nargs="+")
-    parser.add_argument("--force_intra", type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument("--force_intra", type=str2bool, nargs='?', const=True, default=True)
     parser.add_argument("--force_frame_num", type=int, default=-1)
     parser.add_argument("--force_intra_period", type=int, default=-1)
     parser.add_argument('--model_path',  type=str)
@@ -85,7 +85,7 @@ def run_test(video_net, i_frame_net, args, device):
     verbose = args['verbose'] if 'verbose' in args else 0
 
     if args['src_type'] == 'png':
-        src_reader = PNGReader(args['img_path'], args['src_width'], args['src_height'])
+        src_reader = PNGReader("/root/autodl-tmp/test", args['src_width'], args['src_height'])
 
     frame_types = []
     psnrs = []
