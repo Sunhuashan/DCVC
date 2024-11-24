@@ -14,7 +14,7 @@ from compressai.datasets import ImageFolder
 from compressai.zoo import models
 from pytorch_msssim import ms_ssim
 
-from models import IntraNoAR
+from src.models.image_model import IntraNoAR
 from torch.utils.tensorboard import SummaryWriter   
 import os
 
@@ -79,39 +79,53 @@ class CustomDataParallel(nn.DataParallel):
             return getattr(self.module, key)
 
 
-def configure_optimizers(net, args):
-    """Separate parameters for the main optimizer and the auxiliary optimizer.
-    Return two optimizers"""
+# def configure_optimizers(net, args):
+#     """Separate parameters for the main optimizer and the auxiliary optimizer.
+#     Return two optimizers"""
 
-    parameters = {
-        n
-        for n, p in net.named_parameters()
-        if not n.endswith(".quantiles") and p.requires_grad
-    }
-    aux_parameters = {
-        n
-        for n, p in net.named_parameters()
-        if n.endswith(".quantiles") and p.requires_grad
-    }
+#     parameters = {
+#         n
+#         for n, p in net.named_parameters()
+#         if not n.endswith(".quantiles") and p.requires_grad
+#     }
+#     aux_parameters = {
+#         n
+#         for n, p in net.named_parameters()
+#         if n.endswith(".quantiles") and p.requires_grad
+#     }
 
-    # Make sure we don't have an intersection of parameters
-    params_dict = dict(net.named_parameters())
-    inter_params = parameters & aux_parameters
-    union_params = parameters | aux_parameters
+#     # Make sure we don't have an intersection of parameters
+#     params_dict = dict(net.named_parameters())
+#     inter_params = parameters & aux_parameters
+#     union_params = parameters | aux_parameters
 
-    assert len(inter_params) == 0
-    assert len(union_params) - len(params_dict.keys()) == 0
+#     assert len(inter_params) == 0
+#     assert len(union_params) - len(params_dict.keys()) == 0
 
-    optimizer = optim.Adam(
-        (params_dict[n] for n in sorted(parameters)),
-        lr=args.learning_rate,
-    )
-    aux_optimizer = optim.Adam(
-        (params_dict[n] for n in sorted(aux_parameters)),
-        lr=args.aux_learning_rate,
-    )
-    return optimizer, aux_optimizer
+#     optimizer = optim.Adam(
+#         (params_dict[n] for n in sorted(parameters)),
+#         lr=args.learning_rate,
+#     )
+#     aux_optimizer = optim.Adam(
+#         (params_dict[n] for n in sorted(aux_parameters)),
+#         lr=args.aux_learning_rate,
+#     )
+#     return optimizer, aux_optimizer
 
+    def configure_optimizers(self):
+        parameters = {n for n, p in self.p_frame_model.named_parameters()}
+        params_dict = dict(self.p_frame_model.named_parameters())
+
+        optimizer = optim.AdamW(
+            (params_dict[n] for n in sorted(parameters)),
+            lr=1e-4,  # default
+        )
+        # optimizer = optim.Adam(
+        #     (params_dict[n] for n in sorted(parameters)),
+        #     lr=1e-4,  # default
+        # )
+
+        return optimizer
 
 def train_one_epoch(
     model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, type='mse'
@@ -126,7 +140,7 @@ def train_one_epoch(
 
         d = d.to(device)
         optimizer.zero_grad()
-        aux_optimizer.zero_grad()
+        # aux_optimizer.zero_grad()
 
         out_net = model(d, q_scale=q_scale)
 
@@ -138,7 +152,7 @@ def train_one_epoch(
 
         aux_loss = model.aux_loss()
         aux_loss.backward()
-        aux_optimizer.step()
+        # aux_optimizer.step()
 
         if i % 1000 == 0:
             if type == 'mse':
@@ -367,13 +381,13 @@ def main(argv):
     )
 
     # net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320)
-    net = 
+    net = IntraNoAR()
     net = net.to(device)
 
     if args.cuda and torch.cuda.device_count() > 1:
         net = CustomDataParallel(net)
 
-    optimizer, aux_optimizer = configure_optimizers(net, args)
+    optimizer = configure_optimizers(net, args)
     milestones = args.lr_epoch
     print("milestones: ", milestones)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1, last_epoch=-1)
@@ -388,7 +402,7 @@ def main(argv):
         if args.continue_train:
             last_epoch = checkpoint["epoch"] + 1
             optimizer.load_state_dict(checkpoint["optimizer"])
-            aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
+            # aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
             lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
 
     best_loss = float("inf")
@@ -399,7 +413,7 @@ def main(argv):
             criterion,
             train_dataloader,
             optimizer,
-            aux_optimizer,
+            None,
             epoch,
             args.clip_max_norm,
             type
@@ -418,7 +432,7 @@ def main(argv):
                     "state_dict": net.state_dict(),
                     "loss": loss,
                     "optimizer": optimizer.state_dict(),
-                    "aux_optimizer": aux_optimizer.state_dict(),
+                    # "aux_optimizer": aux_optimizer.state_dict(),
                     "lr_scheduler": lr_scheduler.state_dict(),
                 },
                 is_best,
