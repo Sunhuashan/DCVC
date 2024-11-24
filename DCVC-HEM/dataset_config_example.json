@@ -6,7 +6,7 @@
             "base_path": "autodl-tmp",
             "src_type": "png",
             "sequences": {
-                "test":       {"width": 768, "height": 512, "frames": 24, "gop": 10}
+                "test":       {"width": 768, "height": 512, "frames": 24, "gop": 0}
             }
         }
     }
