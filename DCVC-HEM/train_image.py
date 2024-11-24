@@ -14,12 +14,14 @@ from compressai.datasets import ImageFolder
 from compressai.zoo import models
 from pytorch_msssim import ms_ssim
 
-from models import TCM
+from models import IntraNoAR
 from torch.utils.tensorboard import SummaryWriter   
 import os
 
 torch.backends.cudnn.deterministic=True
 torch.backends.cudnn.benchmark=False
+
+lmbda_values = [85, 170, 380, 840] 
 
 def compute_msssim(a, b):
     return ms_ssim(a, b, data_range=1.)
@@ -27,13 +29,12 @@ def compute_msssim(a, b):
 class RateDistortionLoss(nn.Module):
     """Custom rate distortion loss with a Lagrangian parameter."""
 
-    def __init__(self, lmbda=1e-2, type='mse'):
+    def __init__(self, type='mse'):
         super().__init__()
         self.mse = nn.MSELoss()
-        self.lmbda = lmbda
         self.type = type
 
-    def forward(self, output, target):
+    def forward(self, output, target, lmbda):
         N, _, H, W = target.size()
         out = {}
         num_pixels = N * H * W
@@ -44,10 +45,10 @@ class RateDistortionLoss(nn.Module):
         )
         if self.type == 'mse':
             out["mse_loss"] = self.mse(output["x_hat"], target)
-            out["loss"] = self.lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
+            out["loss"] = lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
         else:
             out['ms_ssim_loss'] = compute_msssim(output["x_hat"], target)
-            out["loss"] = self.lmbda * (1 - out['ms_ssim_loss']) + out["bpp_loss"]
+            out["loss"] = lmbda * (1 - out['ms_ssim_loss']) + out["bpp_loss"]
 
         return out
 
@@ -119,13 +120,17 @@ def train_one_epoch(
     device = next(model.parameters()).device
 
     for i, d in enumerate(train_dataloader):
+        # prepare
+        lmbda_value = random.choice(lmbda_values)
+        q_scale = model.q_scale[lmbda_values.index(lmbda_value)].to(device)
+
         d = d.to(device)
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
-        out_net = model(d)
+        out_net = model(d, q_scale=q_scale)
 
-        out_criterion = criterion(out_net, d)
+        out_criterion = criterion(out_net, d, lmbda_value)
         out_criterion["loss"].backward()
         if clip_max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
@@ -135,7 +140,7 @@ def train_one_epoch(
         aux_loss.backward()
         aux_optimizer.step()
 
-        if i % 100 == 0:
+        if i % 1000 == 0:
             if type == 'mse':
                 print(
                     f"Train epoch {epoch}: ["
@@ -169,7 +174,6 @@ def test_epoch(epoch, test_dataloader, model, criterion, type='mse'):
 
         with torch.no_grad():
             for d in test_dataloader:
-                print(f"Image size: {d.shape}")  # 打印图片的尺寸
                 d = d.to(device)
                 out_net = model(d)
                 out_criterion = criterion(out_net, d)
@@ -264,12 +268,12 @@ def parse_args(argv):
         help="Bit-rate distortion parameter (default: %(default)s)",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=4, help="Batch size (default: %(default)s)"
+        "--batch-size", type=int, default=8, help="Batch size (default: %(default)s)"
     )
     parser.add_argument(
         "--test-batch-size",
         type=int,
-        default=4,
+        default=8,
         help="Test batch size (default: %(default)s)",
     )
     parser.add_argument(
@@ -362,7 +366,8 @@ def main(argv):
         pin_memory=(device == "cuda"),
     )
 
-    net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320)
+    # net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320)
+    net = 
     net = net.to(device)
 
     if args.cuda and torch.cuda.device_count() > 1:
@@ -373,7 +378,7 @@ def main(argv):
     print("milestones: ", milestones)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1, last_epoch=-1)
 
-    criterion = RateDistortionLoss(lmbda=args.lmbda, type=type)
+    criterion = RateDistortionLoss(type=type)
 
     last_epoch = 0
     if args.checkpoint:  # load from previous checkpoint
