@@ -26,6 +26,10 @@ lmbda_values = [85, 170, 380, 840]
 def compute_msssim(a, b):
     return ms_ssim(a, b, data_range=1.)
 
+def PSNR(mse):
+    psnr = 20 * torch.log10(1 / torch.sqrt(mse))
+    return psnr.item()
+
 class RateDistortionLoss(nn.Module):
     """Custom rate distortion loss with a Lagrangian parameter."""
 
@@ -34,21 +38,19 @@ class RateDistortionLoss(nn.Module):
         self.mse = nn.MSELoss()
         self.type = type
 
-    def forward(self, output, target, lmbda):
-        N, _, H, W = target.size()
-        out = {}
-        num_pixels = N * H * W
+    def forward(self, out_net, target, lmbda):
+        bpp = out_net["bpp"].sum()
+        mse = out_net["mse"].sum()
+        ssim = out_net["ssim"].sum()
 
-        out["bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-            for likelihoods in output["likelihoods"].values()
-        )
+        out = {"bpp_loss" : bpp }
+
         if self.type == 'mse':
-            out["mse_loss"] = self.mse(output["x_hat"], target)
-            out["loss"] = lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
+            out["mse_loss"] = mse
+            out["loss"] = lmbda * mse + bpp
         else:
-            out['ms_ssim_loss'] = compute_msssim(output["x_hat"], target)
-            out["loss"] = lmbda * (1 - out['ms_ssim_loss']) + out["bpp_loss"]
+            out['ms_ssim_loss'] = ssim
+            out["loss"] = lmbda * (1 - ssim) + bpp
 
         return out
 
@@ -78,10 +80,12 @@ class CustomDataParallel(nn.DataParallel):
         except AttributeError:
             return getattr(self.module, key)
 
-
 # def configure_optimizers(net, args):
 #     """Separate parameters for the main optimizer and the auxiliary optimizer.
 #     Return two optimizers"""
+    
+#     for name, param in net.named_parameters():
+#        print(name, param.size())
 
 #     parameters = {
 #         n
@@ -112,20 +116,16 @@ class CustomDataParallel(nn.DataParallel):
 #     )
 #     return optimizer, aux_optimizer
 
-    def configure_optimizers(self):
-        parameters = {n for n, p in self.p_frame_model.named_parameters()}
-        params_dict = dict(self.p_frame_model.named_parameters())
+def configure_optimizers(net, args):
+    parameters = {n for n, p in net.named_parameters()}
+    params_dict = dict(net.named_parameters())
 
-        optimizer = optim.AdamW(
-            (params_dict[n] for n in sorted(parameters)),
-            lr=1e-4,  # default
-        )
-        # optimizer = optim.Adam(
-        #     (params_dict[n] for n in sorted(parameters)),
-        #     lr=1e-4,  # default
-        # )
+    optimizer = optim.Adam(
+        (params_dict[n] for n in sorted(parameters)),
+        lr=args.learning_rate,  # default
+    )
 
-        return optimizer
+    return optimizer, None
 
 def train_one_epoch(
     model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, type='mse'
@@ -150,8 +150,8 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
         optimizer.step()
 
-        aux_loss = model.aux_loss()
-        aux_loss.backward()
+        # aux_loss = model.aux_loss()
+        # aux_loss.backward()
         # aux_optimizer.step()
 
         if i % 1000 == 0:
@@ -163,7 +163,7 @@ def train_one_epoch(
                     f'\tLoss: {out_criterion["loss"].item():.3f} |'
                     f'\tMSE loss: {out_criterion["mse_loss"].item():.3f} |'
                     f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
-                    f"\tAux loss: {aux_loss.item():.2f}"
+                    # f"\tAux loss: {aux_loss.item():.2f}"
                 )
             else:
                 print(
@@ -173,7 +173,7 @@ def train_one_epoch(
                     f'\tLoss: {out_criterion["loss"].item():.3f} |'
                     f'\tMS_SSIM loss: {out_criterion["ms_ssim_loss"].item():.3f} |'
                     f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
-                    f"\tAux loss: {aux_loss.item():.2f}"
+                    # f"\tAux loss: {aux_loss.item():.2f}"
                 )
 
 
@@ -181,54 +181,60 @@ def test_epoch(epoch, test_dataloader, model, criterion, type='mse'):
     model.eval()
     device = next(model.parameters()).device
     if type == 'mse':
-        loss = AverageMeter()
-        bpp_loss = AverageMeter()
-        mse_loss = AverageMeter()
-        aux_loss = AverageMeter()
-
         with torch.no_grad():
-            for d in test_dataloader:
-                d = d.to(device)
-                out_net = model(d)
-                out_criterion = criterion(out_net, d)
+            for lmbda_value in lmbda_values:
+                loss = AverageMeter()
+                bpp_loss = AverageMeter()
+                mse_loss = AverageMeter()
+                
+                q_scale = model.q_scale[lmbda_values.index(lmbda_value)].to(device)
 
-                aux_loss.update(model.aux_loss())
-                bpp_loss.update(out_criterion["bpp_loss"])
-                loss.update(out_criterion["loss"])
-                mse_loss.update(out_criterion["mse_loss"])
+                for d in test_dataloader:
+                    d = d.to(device)
+                    out_net = model(d, q_scale)
+                    out_criterion = criterion(out_net, d, lmbda_value)
 
-        print(
-            f"Test epoch {epoch}: Average losses:"
-            f"\tLoss: {loss.avg:.3f} |"
-            f"\tMSE loss: {mse_loss.avg:.3f} |"
-            f"\tBpp loss: {bpp_loss.avg:.2f} |"
-            f"\tAux loss: {aux_loss.avg:.2f}\n"
-        )
+                    # aux_loss.update(model.aux_loss())
+                    bpp_loss.update(out_criterion["bpp_loss"])
+                    loss.update(out_criterion["loss"])
+                    mse_loss.update(out_criterion["mse_loss"])
+
+                print(
+                    f"Test epoch {epoch}: Lmbda: {lmbda_value} |"
+                    f"\tLoss: {loss.avg:.3f} |"
+                    f"\tMSE loss: {mse_loss.avg:.3f} |"
+                    f"\tBpp loss: {bpp_loss.avg:.2f} |"
+                    f"\tPSNR: {PSNR(mse_loss.avg):.2f} |"
+                    # f"\tAux loss: {aux_loss.avg:.2f}\n"
+                )
 
     else:
-        loss = AverageMeter()
-        bpp_loss = AverageMeter()
-        ms_ssim_loss = AverageMeter()
-        aux_loss = AverageMeter()
 
         with torch.no_grad():
-            for d in test_dataloader:
-                d = d.to(device)
-                out_net = model(d)
-                out_criterion = criterion(out_net, d)
+            for lmbda_value in lmbda_values:
+                loss = AverageMeter()
+                bpp_loss = AverageMeter()
+                ms_ssim_loss = AverageMeter()
 
-                aux_loss.update(model.aux_loss())
-                bpp_loss.update(out_criterion["bpp_loss"])
-                loss.update(out_criterion["loss"])
-                ms_ssim_loss.update(out_criterion["ms_ssim_loss"])
+                q_scale = model.q_scale[lmbda_values.index(lmbda_value)].to(device)
+                
+                for d in test_dataloader:
+                    d = d.to(device)
+                    out_net = model(d, q_scale)
+                    out_criterion = criterion(out_net, d, lmbda_value)
 
-        print(
-            f"Test epoch {epoch}: Average losses:"
-            f"\tLoss: {loss.avg:.3f} |"
-            f"\tMS_SSIM loss: {ms_ssim_loss.avg:.3f} |"
-            f"\tBpp loss: {bpp_loss.avg:.2f} |"
-            f"\tAux loss: {aux_loss.avg:.2f}\n"
-        )
+                    # aux_loss.update(model.aux_loss())
+                    bpp_loss.update(out_criterion["bpp_loss"])
+                    loss.update(out_criterion["loss"])
+                    ms_ssim_loss.update(out_criterion["ms_ssim_loss"])
+
+                print(
+                    f"Test epoch {epoch}: Lmbda: {lmbda_value} |"
+                    f"\tLoss: {loss.avg:.3f} |"
+                    f"\tMS_SSIM loss: {ms_ssim_loss.avg:.3f} |"
+                    f"\tBpp loss: {bpp_loss.avg:.2f} |"
+                    # f"\tAux loss: {aux_loss.avg:.2f}\n"
+                )
 
     return loss.avg
 
@@ -287,7 +293,7 @@ def parse_args(argv):
     parser.add_argument(
         "--test-batch-size",
         type=int,
-        default=8,
+        default=1,
         help="Test batch size (default: %(default)s)",
     )
     parser.add_argument(
@@ -381,13 +387,13 @@ def main(argv):
     )
 
     # net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320)
-    net = IntraNoAR()
+    net = IntraNoAR(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320)
     net = net.to(device)
 
     if args.cuda and torch.cuda.device_count() > 1:
         net = CustomDataParallel(net)
 
-    optimizer = configure_optimizers(net, args)
+    optimizer, aux_optimizer = configure_optimizers(net, args)
     milestones = args.lr_epoch
     print("milestones: ", milestones)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1, last_epoch=-1)
@@ -413,7 +419,7 @@ def main(argv):
             criterion,
             train_dataloader,
             optimizer,
-            None,
+            aux_optimizer,
             epoch,
             args.clip_max_norm,
             type
